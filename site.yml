@@ -1,0 +1,128 @@
+---
+- name: CIS-aligned hardening baseline (Rocky Linux 10)
+  hosts: all
+  become: true
+
+  handlers:
+    - name: Reload audit rules
+      ansible.builtin.command: augenrules --load
+      changed_when: true
+
+    - name: Reload sshd
+      ansible.builtin.systemd_service:
+        name: sshd
+        state: reloaded
+
+  tasks:
+    # POAM-001 + POAM-003: SSH empty passwords and root login
+    - name: Deploy SSH hardening drop-in
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          PermitRootLogin no
+          PermitEmptyPasswords no
+          MaxAuthTries 4
+      notify: Reload sshd
+
+    - name: Verify sshd configuration parses
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    # POAM-002: accounts with empty password fields
+    - name: Find accounts with empty passwords
+      ansible.builtin.command: awk -F: '($2 == "") { print $1 }' /etc/shadow
+      changed_when: false
+      register: empty_pw_accounts
+
+    - name: Lock accounts with empty passwords
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_lock: true
+      loop: "{{ empty_pw_accounts.stdout_lines }}"
+
+    # POAM-004: password quality enforced for root
+    - name: Enforce password quality for root
+      ansible.builtin.lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^\s*#?\s*enforce_for_root\b'
+        line: 'enforce_for_root'
+        state: present
+
+    # POAM-005: audit modifications to the account databases
+    - name: Ensure auditd is installed
+      ansible.builtin.dnf:
+        name: audit
+        state: present
+
+    - name: Deploy account-database audit rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/50-usergroup-modification.rules
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          -w /etc/group -p wa -k audit_rules_usergroup_modification
+          -w /etc/gshadow -p wa -k audit_rules_usergroup_modification
+          -w /etc/passwd -p wa -k audit_rules_usergroup_modification
+          -w /etc/shadow -p wa -k audit_rules_usergroup_modification
+          -w /etc/security/opasswd -p wa -k audit_rules_usergroup_modification
+      notify: Reload audit rules
+
+    - name: Ensure auditd is running and enabled
+      ansible.builtin.systemd_service:
+        name: auditd
+        state: started
+        enabled: true
+
+    # POAM-006: shell session timeout
+    - name: Set shell session timeout
+      ansible.builtin.copy:
+        dest: /etc/profile.d/tmout.sh
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          typeset -xr TMOUT=900
+
+    # Supporting baseline items
+    - name: Protect shadow files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: '0000'
+      loop:
+        - /etc/shadow
+        - /etc/gshadow
+
+    - name: Ensure firewalld is installed
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld is running and enabled
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Allow only SSH through the firewall
+      ansible.posix.firewalld:
+        service: ssh
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Ensure automatic updates are installed
+      ansible.builtin.dnf:
+        name: dnf-automatic
+        state: present
+
+    - name: Enable the automatic update timer
+      ansible.builtin.systemd_service:
+        name: dnf-automatic.timer
+        state: started
+        enabled: true
