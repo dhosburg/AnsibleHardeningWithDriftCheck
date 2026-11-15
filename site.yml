@@ -1,6 +1,7 @@
 ---
 - name: CIS-aligned hardening baseline (Rocky Linux 10)
   hosts: all
+  connection: local
   become: true
 
   handlers:
@@ -31,17 +32,28 @@
       ansible.builtin.command: sshd -t
       changed_when: false
 
+    - name: Align root login directive in main sshd_config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*#?\s*PermitRootLogin\s+'
+        line: 'PermitRootLogin no'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Reload sshd
+
     # POAM-002: accounts with empty password fields
-    - name: Find accounts with empty passwords
-      ansible.builtin.command: awk -F: '($2 == "") { print $1 }' /etc/shadow
-      changed_when: false
-      register: empty_pw_accounts
+    - name: Read the shadow database
+      ansible.builtin.getent:
+        database: shadow
 
     - name: Lock accounts with empty passwords
       ansible.builtin.user:
-        name: "{{ item }}"
+        name: "{{ item.key }}"
         password_lock: true
-      loop: "{{ empty_pw_accounts.stdout_lines }}"
+      loop: "{{ ansible_facts.getent_shadow | dict2items }}"
+      when: item.value[0] == ''
+      loop_control:
+        label: "{{ item.key }}"
 
     # POAM-004: password quality enforced for root
     - name: Enforce password quality for root
@@ -56,6 +68,14 @@
       ansible.builtin.dnf:
         name: audit
         state: present
+
+    - name: Ensure audit rules directory exists
+      ansible.builtin.file:
+        path: /etc/audit/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
 
     - name: Deploy account-database audit rules
       ansible.builtin.copy:
